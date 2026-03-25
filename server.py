@@ -334,8 +334,15 @@ def generate_tts(text: str, voice_id: str):
     if not MURF_API_KEY or not text:
         return None
     try:
+        # Strip markdown so Murf reads clean text
+        clean = strip_markdown(text)
+        # Murf has a ~3000 char limit
+        clean = clean[:3000].strip()
+        if not clean:
+            return None
+
         res = requests.post(MURF_TTS_URL, json={
-            'voiceId': voice_id, 'text': text[:3000],
+            'voiceId': voice_id, 'text': clean,
             'audioFormat': 'MP3', 'sampleRate': 24000, 'encodeAsBase64': False,
         }, headers={'api-key': MURF_API_KEY, 'Content-Type': 'application/json'}, timeout=30)
 
@@ -345,9 +352,10 @@ def generate_tts(text: str, voice_id: str):
             return None
 
         data = res.json()
+        print(f'[TTS] Murf response keys: {list(data.keys())}')
         audio_url = data.get('audioFile') or data.get('audio_file') or data.get('url')
         if not audio_url:
-            print(f'[TTS] No URL in: {data}')
+            print(f'[TTS] No audio URL in response: {data}')
             return None
 
         token = str(uuid.uuid4())
@@ -356,6 +364,31 @@ def generate_tts(text: str, voice_id: str):
     except Exception as e:
         print(f'[TTS Error] {e}')
         return None
+
+
+def strip_markdown(text: str) -> str:
+    """Remove markdown formatting so Murf TTS reads clean natural text."""
+    import re
+    # Remove code blocks
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`[^`]*`', '', text)
+    # Remove headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove bold/italic
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
+    text = re.sub(r'_{1,3}([^_]+)_{1,3}', r'\1', text)
+    # Remove links
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # Remove bullet points
+    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    # Remove blockquotes
+    text = re.sub(r'^\s*>\s+', '', text, flags=re.MULTILINE)
+    # Remove horizontal rules
+    text = re.sub(r'^[-*_]{3,}$', '', text, flags=re.MULTILINE)
+    # Clean up extra whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 @app.route('/api/tts/proxy/<token>')
