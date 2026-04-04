@@ -70,15 +70,14 @@ class VoiceAssistant:
             import google.generativeai as genai
             self.models = []
             for key in GEMINI_KEYS:
-                # Each key needs its own client — use the newer SDK pattern
-                client = genai.GenerativeModel.__new__(genai.GenerativeModel)
+                # Configure with this key, then build a model bound to it
                 genai.configure(api_key=key)
                 model = genai.GenerativeModel(
                     model_name='gemini-2.5-flash',
                     system_instruction=PERSONAS[self.mode],
                 )
                 self.models.append((key, model))
-            # Reset to first key as active
+            # Leave genai configured with the first key as active
             genai.configure(api_key=GEMINI_KEYS[0])
             self.current_key_idx = 0
             print(f'[Assistant] {len(self.models)} Gemini model(s) ready (mode: {self.mode})')
@@ -99,10 +98,9 @@ class VoiceAssistant:
         if next_idx == self.current_key_idx:
             return False
         self.current_key_idx = next_idx
-        # Reconfigure genai with the new key
         try:
             import google.generativeai as genai
-            genai.configure(api_key=GEMINI_KEYS[self.current_key_idx])
+            genai.configure(api_key=self.models[self.current_key_idx][0])
         except Exception:
             pass
         print(f'[Assistant] Rotated to API key #{self.current_key_idx + 1}')
@@ -124,7 +122,8 @@ class VoiceAssistant:
             try:
                 parts = []
                 if pdf_text:
-                    parts.append(f"The user shared a PDF. Content:\n\n{pdf_text[:8000]}\n\nQuestion: {user_input}")
+                    combined = f"The user shared a PDF. Content:\n\n{pdf_text[:8000]}\n\nQuestion: {user_input}"
+                    parts.append(combined)
                 elif user_input:
                     parts.append(user_input)
                 if image_data:
@@ -142,7 +141,9 @@ class VoiceAssistant:
                     return "I got an empty response — please try again."
 
                 print(f'[Gemini key#{self.current_key_idx+1}] Reply ({len(reply)} chars)')
-                self.history.append({'role': 'user',  'parts': [user_input or '(attachment)']})
+                # Store what was actually sent so history context stays accurate
+                history_user_text = parts[0] if isinstance(parts[0], str) else (user_input or '(attachment)')
+                self.history.append({'role': 'user',  'parts': [history_user_text]})
                 self.history.append({'role': 'model', 'parts': [reply]})
                 return reply
 

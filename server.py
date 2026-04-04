@@ -5,7 +5,9 @@ Flask server — text, image, PDF, voice, chart support.
 import os
 import re
 import uuid
+import time
 import tempfile
+import threading
 import requests
 from flask import Flask, request, jsonify, send_from_directory, Response
 from dotenv import load_dotenv
@@ -20,7 +22,29 @@ MURF_API_KEY = os.getenv('MURF_API_KEY')
 MURF_TTS_URL = 'https://api.murf.ai/v1/speech/generate'
 
 assistant = VoiceAssistant(mode=os.getenv('ASSISTANT_MODE', 'tutor'))
+
+# TTS cache with TTL to prevent unbounded memory growth
 _tts_cache = {}
+_tts_cache_lock = threading.Lock()
+_TTS_CACHE_TTL = 120  # seconds
+
+def _tts_cache_set(token: str, url: str):
+    with _tts_cache_lock:
+        _tts_cache[token] = {'url': url, 'ts': time.time()}
+    # Evict expired entries
+    _tts_cache_evict()
+
+def _tts_cache_pop(token: str):
+    with _tts_cache_lock:
+        entry = _tts_cache.pop(token, None)
+    return entry['url'] if entry else None
+
+def _tts_cache_evict():
+    now = time.time()
+    with _tts_cache_lock:
+        expired = [k for k, v in _tts_cache.items() if now - v['ts'] > _TTS_CACHE_TTL]
+        for k in expired:
+            del _tts_cache[k]
 
 
 # ── Static ────────────────────────────────
@@ -359,7 +383,7 @@ def generate_tts(text: str, voice_id: str):
             return None
 
         token = str(uuid.uuid4())
-        _tts_cache[token] = audio_url
+        _tts_cache_set(token, audio_url)
         return f'/api/tts/proxy/{token}'
     except Exception as e:
         print(f'[TTS Error] {e}')
@@ -393,7 +417,7 @@ def strip_markdown(text: str) -> str:
 
 @app.route('/api/tts/proxy/<token>')
 def tts_proxy(token):
-    url = _tts_cache.pop(token, None)
+    url = _tts_cache_pop(token)
     if not url:
         return 'Not found', 404
     r = requests.get(url, timeout=30, stream=True)

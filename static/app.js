@@ -8,6 +8,7 @@ const state = {
   playbackSpeed: 1, volume: 1,
   mediaRecorder: null, audioChunks: [],
   audioCtx: null, analyser: null, animFrameId: null, currentAudio: null,
+  abortController: null,  // tracks the current in-flight request
 };
 
 const VOICE_AVATARS = {
@@ -176,10 +177,31 @@ function onTextKeydown(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendTextMessage(); }
 }
 
+function interruptCurrent() {
+  // Abort any in-flight fetch
+  if (state.abortController) {
+    state.abortController.abort();
+    state.abortController = null;
+  }
+  // Stop any playing audio
+  if (state.currentAudio) {
+    state.currentAudio.pause();
+    state.currentAudio = null;
+  }
+  if (window.speechSynthesis) window.speechSynthesis.cancel();
+  stopEqAnimation();
+  // Remove any lingering typing indicators
+  document.querySelectorAll('.typing-indicator').forEach(el => el.remove());
+  state.isThinking = false;
+}
+
 async function sendTextMessage() {
   const text = textInput.value.trim();
   if (!text && !pendingFile) return;
-  if (state.isThinking) return;
+
+  // If something is already running, interrupt it first
+  if (state.isThinking) interruptCurrent();
+
   state.isThinking = true;
   sendBtn.disabled = true;
   textInput.value = '';
@@ -199,6 +221,10 @@ async function processUserInput(userText) {
   setStatus('thinking');
   const typingId = showTypingIndicator();
 
+  // Create a fresh abort controller for this request
+  const controller = new AbortController();
+  state.abortController = controller;
+
   try {
     let res;
     const voice = state.voice;
@@ -208,18 +234,19 @@ async function processUserInput(userText) {
       fd.append('image', pendingFile);
       fd.append('message', userText || 'Describe this image in detail.');
       fd.append('voice', voice);
-      res = await fetch('/api/chat/image', { method: 'POST', body: fd });
+      res = await fetch('/api/chat/image', { method: 'POST', body: fd, signal: controller.signal });
     } else if (pendingFile && pendingFileType === 'pdf') {
       const fd = new FormData();
       fd.append('pdf', pendingFile);
       fd.append('message', userText || 'Summarize this document.');
       fd.append('voice', voice);
-      res = await fetch('/api/chat/pdf', { method: 'POST', body: fd });
+      res = await fetch('/api/chat/pdf', { method: 'POST', body: fd, signal: controller.signal });
     } else {
       res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: userText, mode: state.mode, voice }),
+        signal: controller.signal,
       });
     }
 
@@ -238,12 +265,15 @@ async function processUserInput(userText) {
 
   } catch (err) {
     removeTypingIndicator(typingId);
+    // Silently discard aborted requests — user sent a new message intentionally
+    if (err.name === 'AbortError') return;
     const errMsg = 'Sorry, something went wrong. Please try again.';
     addMessage('assistant', errMsg);
     browserSpeak(errMsg);
     showToast('Connection error — check the server', 'error');
     console.error(err);
   } finally {
+    if (state.abortController === controller) state.abortController = null;
     setStatus('ready');
     state.isThinking = false;
   }
@@ -306,11 +336,16 @@ async function playAudioUrl(url) {
     audio.volume = state.volume;
     state.currentAudio = audio;
     if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = state.audioCtx.createMediaElementSource(audio);
-    const analyser = state.audioCtx.createAnalyser();
-    analyser.fftSize = 64;
-    src.connect(analyser); analyser.connect(state.audioCtx.destination);
-    state.analyser = analyser;
+    // Each Audio element can only have one MediaElementSource — create it once
+    if (!audio._srcNode) {
+      const src = state.audioCtx.createMediaElementSource(audio);
+      const analyser = state.audioCtx.createAnalyser();
+      analyser.fftSize = 64;
+      src.connect(analyser); analyser.connect(state.audioCtx.destination);
+      audio._srcNode = src;
+      audio._analyser = analyser;
+    }
+    state.analyser = audio._analyser;
     animateEqBars();
     audio.onended = () => { state.currentAudio = null; setStatus('ready'); stopEqAnimation(); resolve(); };
     audio.onerror = () => { setStatus('ready'); resolve(); };
@@ -325,10 +360,45 @@ function speakText(text) {
 
 function browserSpeak(text) {
   if (!window.speechSynthesis) return;
-  const utt = new SpeechSynthesisUtterance(text);
-  utt.rate = state.playbackSpeed; utt.volume = state.volume;
-  utt.onstart = () => setStatus('speaking'); utt.onend = () => setStatus('ready');
-  window.speechSynthesis.speak(utt);
+  window.speechSynthesis.cancel();
+
+  // Strip markdown for clean reading
+  const clean = text
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`]*`/g, '')
+    .replace(/#{1,6}\s+/g, '')
+    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
+    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
+    .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    .replace(/^\s*>\s+/gm, '')
+    .replace(/\n{2,}/g, '. ')
+    .replace(/\n/g, ' ')
+    .trim();
+
+  if (!clean) return;
+
+  // Split into sentence chunks for reliable playback
+  const sentences = clean.match(/[^.!?]+[.!?]+/g) || [clean];
+  const chunks = [];
+  let cur = '';
+  for (const s of sentences) {
+    if ((cur + s).length > 180) { if (cur) chunks.push(cur.trim()); cur = s; }
+    else cur += s;
+  }
+  if (cur.trim()) chunks.push(cur.trim());
+
+  let idx = 0;
+  function next() {
+    if (idx >= chunks.length) { setStatus('ready'); return; }
+    const utt = new SpeechSynthesisUtterance(chunks[idx++]);
+    utt.rate = state.playbackSpeed; utt.volume = state.volume; utt.lang = 'en-US';
+    if (idx === 1) utt.onstart = () => setStatus('speaking');
+    utt.onend = next; utt.onerror = next;
+    window.speechSynthesis.speak(utt);
+  }
+  next();
 }
 
 function addMessage(role, text, file = null, fileType = null, chartData = null, fetchedImages = []) {
@@ -413,6 +483,7 @@ function setStatus(s) {
 }
 
 function resetConversation() {
+  interruptCurrent();
   fetch('/api/reset', { method: 'POST' }).catch(() => {});
   state.messages = []; state.wordCount = 0; state.responseCount = 0;
   messagesEl.innerHTML = '';

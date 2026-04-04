@@ -27,6 +27,10 @@ def speak(text: str) -> None:
     if not text.strip():
         return
 
+    if not MURF_API_KEY:
+        print("[TTS] No MURF_API_KEY set — skipping speech.")
+        return
+
     headers = {
         "api-key": MURF_API_KEY,
         "Content-Type": "application/json",
